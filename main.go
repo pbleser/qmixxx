@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -24,11 +26,16 @@ var (
 	dbConn         *sql.DB
 )
 
+type playbackFinishedMsg struct {
+	file string
+}
+
 type track struct {
 	title     string
 	artist    string
 	genre     string
 	playCount int
+	location  int
 	rawQuery  string // Kept so the renderer knows what terms to highlight
 }
 
@@ -109,6 +116,8 @@ type model struct {
 	list      list.Model
 	textInput textinput.Model
 	searching bool
+	playing   bool
+	err       error
 }
 
 func initialModel() model {
@@ -127,6 +136,7 @@ func initialModel() model {
 		list:      l,
 		textInput: ti,
 		searching: true,
+		playing:   false,
 	}
 }
 
@@ -141,6 +151,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			return m, tea.Quit
+
+		case "p":
+			if !m.searching && !m.playing {
+				if selectedItem := m.list.SelectedItem(); selectedItem != nil {
+					if t, ok := selectedItem.(track); ok {
+						if location, err := queryLocation(t.location); err != nil {
+							m.list.Title = fmt.Sprintf("Database Error: %v", err)
+						} else {
+							m.playing = true
+							return m, playAudioCmd(location)
+						}
+					}
+				}
+			}
 
 		case "enter":
 			if m.searching {
@@ -181,9 +205,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case playbackFinishedMsg:
+		m.playing = false
+		// 2. CRITICAL: mplayer exited, clear the artifacts and force a full UI redraw
+		return m, tea.ClearScreen
+
 	case tea.WindowSizeMsg:
 		h, v := docStyle.GetFrameSize()
 		m.list.SetSize(msg.Width-h, msg.Height-v-4)
+
+	case error:
+		m.err = msg
+		m.playing = false
+		return m, tea.ClearScreen
 	}
 
 	// Route keystrokes properly based on focus
@@ -201,6 +235,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	if m.playing {
+		// This text is briefly visible before mplayer draws over the screen,
+		// and won't interfere with mplayer's controls.
+		return "Launching mplayer...\n"
+	}
+
+	if m.err != nil {
+		return fmt.Sprintf("Error playing audio: %v\n\nPress 'q' to quit.", m.err)
+	}
+
 	var s strings.Builder
 	s.WriteString(m.textInput.View())
 	s.WriteString("\n\n")
@@ -238,7 +282,7 @@ func queryTracksFromDB(filter string) ([]list.Item, error) {
 	}
 
 	baseQuery := fmt.Sprintf(`
-		SELECT title, artist, IFNULL(genre, ''), IFNULL(timesplayed, 0)
+		SELECT title, artist, IFNULL(genre, ''), IFNULL(timesplayed, 0), location
 		FROM library 
 		WHERE mixxx_deleted = 0 
 		  AND %s
@@ -255,7 +299,7 @@ func queryTracksFromDB(filter string) ([]list.Item, error) {
 	var items []list.Item
 	for rows.Next() {
 		var t track
-		if err := rows.Scan(&t.title, &t.artist, &t.genre, &t.playCount); err != nil {
+		if err := rows.Scan(&t.title, &t.artist, &t.genre, &t.playCount, &t.location); err != nil {
 			return nil, err
 		}
 		t.title = mFallback(t.title, "Unknown Title")
@@ -266,6 +310,22 @@ func queryTracksFromDB(filter string) ([]list.Item, error) {
 	return items, nil
 }
 
+func queryLocation(id int) (string, error) {
+	rows, err := dbConn.Query(`SELECT location FROM track_locations WHERE id=?`, id)
+	if err != nil {
+		return "", err
+	}
+	location := ""
+	if rows.Next() {
+		if err := rows.Scan(&location); err != nil {
+			return "", err
+		}
+		return location, nil
+	} else {
+		return "", fmt.Errorf("failed to find location with id=%d", id)
+	}
+}
+
 func mFallback(val, fallback string) string {
 	if strings.TrimSpace(val) == "" {
 		return fallback
@@ -273,20 +333,39 @@ func mFallback(val, fallback string) string {
 	return val
 }
 
+func playAudioCmd(file string) tea.Cmd {
+	//cmd := exec.Command("mplayer", "-quiet", file)
+	cmd := exec.Command("mpv", "--no-video", "--force-window=no", "--term-osd-bar=yes", file)
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		if err != nil {
+			return err
+		} else {
+			return playbackFinishedMsg{file: file}
+		}
+	})
+}
+
 func main() {
-	if len(os.Args) != 2 {
+	dbPath := ""
+	switch len(os.Args) {
+	case 1:
+		home, _ := os.UserHomeDir()
+		dbPath = filepath.Join(home, ".mixxx", "mixxxdb.sqlite")
+	case 2:
+		dbPath = os.Args[1]
+	default:
 		log.Fatalf("Error: must specify path to Mixxx database.")
 	}
-	dbPath := os.Args[1]
 
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		log.Fatalf("Error: Mixxx database not found at %s.", dbPath)
 	}
 
+	dsn := fmt.Sprintf("file:%s?mode=ro&immutable=1", dbPath)
 	var err error
-	dbConn, err = sql.Open("sqlite3", dbPath)
+	dbConn, err = sql.Open("sqlite3", dsn)
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		log.Fatalf("Failed to connect to database using DSN '%s': %v", dsn, err)
 	}
 	defer dbConn.Close()
 
